@@ -1,29 +1,34 @@
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/workspace \
+ENV PYTHONDONTWRITEBYTECODE=1 \\
+    PYTHONUNBUFFERED=1 \\
+    PYTHONPATH=/workspace \\
     FLASK_DEBUG=0
 
-# OpenCV, ONNX Runtime and pytesseract need native system libraries.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 \
-    libglib2.0-0 \
-    libgomp1 \
-    tesseract-ocr \
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    libglib2.0-0 \\
+    libgomp1 \\
+    tesseract-ocr \\
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
-COPY requirements.txt ./requirements.txt
-RUN python -m pip install --no-cache-dir --upgrade pip \
-    && python -m pip install --no-cache-dir -r requirements.txt
+COPY requirements-runtime.txt ./requirements-runtime.txt
+RUN python -m pip install --no-cache-dir --upgrade pip \\
+    && python -m pip install --no-cache-dir -r requirements-runtime.txt
 
-# Copy the repository so the app can import src.* and load models/data if present.
-COPY . ./
+COPY app/ ./app/
+COPY src/ ./src/
+COPY models/classification/ ./models/classification/
+COPY models/vision/best.onnx ./models/vision/best.onnx
+COPY outputs/results/ ./outputs/results/
+
+RUN groupadd --gid 1000 app \\
+    && useradd --uid 1000 --gid app --no-create-home --home-dir /workspace app \\
+    && mkdir -p /workspace/data/processed/scans \\
+    && chown -R app:app /workspace
 
 ENV SMARTPARKING_API_URL=http://backend:8080
 EXPOSE 5000
+USER app
 
-# Flask CLI binds to 0.0.0.0 inside the container. This avoids app.run's
-# default localhost-only bind and does not enable the development debugger.
-CMD ["python", "-m", "flask", "--app", "app.app", "run", "--host=0.0.0.0", "--port=5000"]
+CMD ["gunicorn", "--bind=0.0.0.0:5000", "--workers=1", "--threads=4", "--timeout=120", "--access-logfile=-", "--error-logfile=-", "app.app:app"]

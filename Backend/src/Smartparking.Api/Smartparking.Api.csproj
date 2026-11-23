@@ -15,6 +15,11 @@
   <ItemGroup>
     <ProjectReference Include="..\SmartParking.Application\SmartParking.Application.csproj" />
     <ProjectReference Include="..\SmartParking.Infrastructure\SmartParking.Infrastructure.csproj" />
+    <Content Include="..\..\..\database\init_smartparking_sqlserver.sql">
+      <Link>database\init_smartparking_sqlserver.sql</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
   </ItemGroup>
 
 </Project>

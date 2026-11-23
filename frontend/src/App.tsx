@@ -3,6 +3,7 @@ import {
   deletePlateScan,
   fetchPlateScans,
   fetchPlateScanStats,
+  getScanImageUrl,
   previewPlate,
   scanPlate,
 } from './api'
@@ -370,7 +371,9 @@ export default function App() {
                 scanId: Date.now(),
                 plate: scanRes.plate || rawPlate,
                 confidence: scanRes.confidence || 0.95,
-                cropImagePath: scanRes.crop_path ? `/scan-image/${(scanRes.crop_path as string).split(/[\\/]/).pop()}` : null,
+                cropImagePath: scanRes.crop_path
+                  ? getScanImageUrl(`/scan-image/${scanRes.crop_path.split(/[\\/]/).pop()}`)
+                  : null,
                 scanTime: new Date().toISOString(),
                 note: 'Tự động quét từ camera',
                 colorCode: scanRes.plate_color?.color_code ?? null,

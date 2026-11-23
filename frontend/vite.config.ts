@@ -26,6 +26,10 @@ export default defineConfig({
         target: pythonTarget,
         changeOrigin: true,
       },
+      '/scan-image': {
+        target: pythonTarget,
+        changeOrigin: true,
+      },
     },
   },
 })

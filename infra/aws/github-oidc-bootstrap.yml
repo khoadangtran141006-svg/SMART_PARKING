@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Creates a branch-restricted GitHub Actions OIDC role for deploying SMART_PARKING
+  containers to the ECS resources created by infra/aws/stack.yml.
+
+Parameters:
+  StackName:
+    Type: String
+    Default: smartparking-prod
+    AllowedPattern: "^[A-Za-z0-9-]+$"
+    Description: Must match the application CloudFormation stack name.
+  RepositoryOwner:
+    Type: String
+    Default: khoadangtran141006-svg
+    AllowedPattern: "^[A-Za-z0-9-]+$"
+  RepositoryName:
+    Type: String
+    Default: SMART_PARKING
+    AllowedPattern: "^[A-Za-z0-9_.-]+$"
+  DeploymentBranch:
+    Type: String
+    Default: DangkhoiJR
+    AllowedPattern: "^[A-Za-z0-9_.-]+$"
+    Description: Only workflows running from this branch can assume the role.
+  CreateOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Set false when this AWS account already has the GitHub Actions OIDC provider.
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: Existing IAM OIDC provider ARN, required when CreateOidcProvider is false.
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  GitHubActionsOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: SMART_PARKING
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackName}-github-deploy"
+      Description: Branch-scoped OIDC role for SMART_PARKING GitHub Actions deployments.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateOidcProvider
+                - !Ref GitHubActionsOidcProvider
+                - !Ref ExistingOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub "repo:${RepositoryOwner}/${RepositoryName}:ref:refs/heads/${DeploymentBranch}"
+      Policies:
+        - PolicyName: DeploySmartParkingEcsImages
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: GetCallerIdentity
+                Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: "*"
+              - Sid: EcrAuthorization
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PushSmartParkingImages
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${StackName}-backend"
+                  - !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${StackName}-python"
+              - Sid: ReadAndUpdateSmartParkingStack
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:UpdateStack
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}/*"
+              - Sid: RunDatabaseInitializationTask
+                Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${StackName}-db-init:*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${StackName}-cluster"
+              - Sid: InspectAndWaitForTasks
+                Effect: Allow
+                Action:
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                Resource: "*"
+              - Sid: WaitForSmartParkingServices
+                Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${StackName}-cluster/${StackName}-backend-service"
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${StackName}-cluster/${StackName}-python-service"
+
+              - Sid: ReadDatabaseMigrationLogs
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${StackName}/database-migration:*"
+              - Sid: PassOnlyEcsTaskExecutionRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StackName}-ecs-execution"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Sid: PassOnlyCloudFormationEcsRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StackName}-cfn-ecs-execution"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: SMART_PARKING
+
+Outputs:
+  GitHubDeployRoleArn:
+    Description: Add this value as the AWS_DEPLOY_ROLE_ARN repository variable in GitHub.
+    Value: !GetAtt GitHubDeployRole.Arn
+  OidcProviderArn:
+    Description: GitHub Actions OIDC provider ARN for reuse in this AWS account.
+    Value: !If
+      - ShouldCreateOidcProvider
+      - !Ref GitHubActionsOidcProvider
+      - !Ref ExistingOidcProviderArn

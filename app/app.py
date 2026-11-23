@@ -29,6 +29,30 @@ from src.vision.plate_ocr import normalize_plate, recognize_plate
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
+CORS_ALLOWED_ORIGINS = {
+    origin.strip().rstrip("/")
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+}
+
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin", "").rstrip("/")
+    if origin and origin in CORS_ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Accept, Content-Type"
+        vary = response.headers.get("Vary", "")
+        if "Origin" not in {value.strip() for value in vary.split(",")}:
+            response.headers["Vary"] = f"{vary}, Origin".strip(", ")
+    return response
+
+
+@app.get("/health")
+def health_check():
+    return jsonify({"status": "ok"})
+
 
 SCAN_DIR = ROOT_DIR / "data" / "processed" / "scans"
 SCAN_DIR.mkdir(parents=True, exist_ok=True)
