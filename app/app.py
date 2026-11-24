@@ -4,12 +4,16 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import base64
+import io
 import json
 import cv2
 import numpy as np
 import os
 import ssl
 import sys
+
+import cloudinary
+import cloudinary.uploader
 
 from flask import Flask, jsonify, redirect, request, send_from_directory
 
@@ -56,6 +60,17 @@ def health_check():
 
 SCAN_DIR = ROOT_DIR / "data" / "processed" / "scans"
 SCAN_DIR.mkdir(parents=True, exist_ok=True)
+
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
+CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
+CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
+
+cloudinary.config(
+    cloud_name=CLOUDINARY_CLOUD_NAME,
+    api_key=CLOUDINARY_API_KEY,
+    api_secret=CLOUDINARY_API_SECRET,
+    secure=True,
+)
 
 COLOR_MODEL_META_PATH = ROOT_DIR / "models" / "classification" / "model_metadata.json"
 ALGORITHM_COMPARISON_PATH = ROOT_DIR / "outputs" / "results" / "algorithm_comparison.json"
@@ -207,6 +222,38 @@ def _safe_upload_name(filename: str):
     )
     return safe[:80] or "plate-image.jpg"
 
+def _upload_image_to_cloudinary(
+    image_bytes: bytes,
+    public_id: str,
+) -> str:
+    if not image_bytes:
+        raise ValueError("Không có dữ liệu ảnh để upload.")
+
+    if not all([
+        CLOUDINARY_CLOUD_NAME,
+        CLOUDINARY_API_KEY,
+        CLOUDINARY_API_SECRET,
+    ]):
+        raise RuntimeError(
+            "Thiếu cấu hình Cloudinary. "
+            "Vui lòng kiểm tra CLOUDINARY_CLOUD_NAME, "
+            "CLOUDINARY_API_KEY và CLOUDINARY_API_SECRET."
+        )
+
+    result = cloudinary.uploader.upload(
+        io.BytesIO(image_bytes),
+        folder="smart-parking/scans",
+        public_id=public_id,
+        resource_type="image",
+        overwrite=False,
+    )
+
+    image_url = result.get("secure_url")
+
+    if not image_url:
+        raise RuntimeError("Cloudinary không trả về secure_url.")
+
+    return image_url
 
 @app.route("/")
 @app.route("/dashboard")
@@ -291,18 +338,34 @@ def scan_plate():
         plate_color = _classify_crop_b64(ocr.get("crop_jpeg_b64"))
         color_label = plate_color.get("color_label") or "Chưa phân loại màu biển số"
 
+        
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         safe_filename = _safe_upload_name(uploaded.filename)
-        image_path = SCAN_DIR / "{}_{}".format(stamp, safe_filename)
-        image_path.write_bytes(image_bytes)
 
-        crop_path = ""
+        # Upload ảnh gốc lên Cloudinary
+        original_public_id = "{}_{}".format(
+            stamp,
+            Path(safe_filename).stem,
+        )
+
+        image_url = _upload_image_to_cloudinary(
+            image_bytes,
+            original_public_id,
+        )
+
+        # Upload ảnh biển số đã cắt nếu OCR tạo được crop
+        crop_url = None
         crop_base64 = ocr.get("crop_jpeg_b64")
-        if crop_base64:
-            crop_file = SCAN_DIR / "{}_crop.jpg".format(stamp)
-            crop_file.write_bytes(base64.b64decode(crop_base64))
-            crop_path = str(crop_file)
 
+        if crop_base64:
+            crop_bytes = base64.b64decode(crop_base64)
+
+            crop_url = _upload_image_to_cloudinary(
+                crop_bytes,
+                "{}_crop".format(stamp),
+            )
+
+        # Lưu thông tin nhận diện cùng URL Cloudinary
         record = {
             "id": stamp,
             "plate": detected_plate,
@@ -310,8 +373,8 @@ def scan_plate():
             "confidence": ocr.get("confidence"),
             "engine": ocr.get("engine"),
             "source_filename": uploaded.filename,
-            "image_path": str(image_path),
-            "crop_path": crop_path,
+            "image_path": image_url,
+            "crop_path": crop_url,
             "plate_color": plate_color,
             "extra": {
                 "bbox": ocr.get("bbox"),
@@ -319,7 +382,9 @@ def scan_plate():
                 "message": ocr.get("message"),
             },
         }
+
         _save_scan_record(record)
+
 
         database_saved = False
         database_message = None
@@ -332,12 +397,8 @@ def scan_plate():
                     payload={
                         "plate": detected_plate,
                         "confidence": _confidence_for_backend(ocr),
-                        "imagePath": "/scan-image/{}".format(image_path.name),
-                        "cropImagePath": (
-                            "/scan-image/{}".format(Path(crop_path).name)
-                            if crop_path
-                            else None
-                        ),
+                        "imagePath": image_url,
+                        "cropImagePath": crop_url,                        
                         "plateColorCode": (
                             plate_color.get("color_code")
                             if plate_color.get("color_code") != "Unknown"
@@ -360,7 +421,7 @@ def scan_plate():
             except BackendApiError as exc:
                 database_message = exc.message
                 print(
-                    "[Warning] Không thể lưu lượt nhận diện vào SQL Server: {}".format(
+                    "[Warning] Không thể lưu lượt nhận diện vào PostgreSQL: {}".format(
                         exc.message
                     )
                 )
@@ -380,8 +441,8 @@ def scan_plate():
                 "crop_jpeg_b64": ocr.get("crop_jpeg_b64"),
                 "annotated_jpeg_b64": ocr.get("annotated_jpeg_b64"),
                 "saved": record,
-                "image_path": str(image_path),
-                "crop_path": crop_path,
+                "image_path": image_url,
+                "crop_path": crop_url,
                 "database_saved": database_saved,
                 "database_message": database_message,
             }

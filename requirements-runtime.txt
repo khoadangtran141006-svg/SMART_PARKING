@@ -1,10 +1,12 @@
+
 flask
 gunicorn
 joblib
 numpy
-scikit-learn
+scikit-learn==1.9.1
 pillow
 opencv-python-headless
 rapidocr
 onnxruntime
 pytesseract
+cloudinary
