@@ -7,8 +7,12 @@ env
 **/*.py[cod]
 **/.pytest_cache/
 **/.ipynb_checkpoints/
-frontend/node_modules/
-frontend/dist/
+**/*.ipynb
+frontend/
+notebooks/
+data/
+reports/
+models/vision/*.pt
 Backend/**/bin/
 Backend/**/obj/
 Backend/**/.vs/

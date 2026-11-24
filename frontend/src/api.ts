@@ -129,6 +129,22 @@ export type ScanResult = {
   [key: string]: unknown
 }
 
+const API_ORIGIN = (import.meta.env.VITE_API_ORIGIN ?? '').replace(/\/+$/, '')
+
+function backendUrl(path: string): string {
+  return API_ORIGIN ? `${API_ORIGIN}/api/PlateScans${path}` : `/backend-api/PlateScans${path}`
+}
+
+function pythonUrl(path: string): string {
+  return API_ORIGIN ? `${API_ORIGIN}/api/${path}` : `/python-api/${path}`
+}
+
+export function getScanImageUrl(path: string | null | undefined): string | null {
+  if (!path) return null
+  if (/^https?:\/\//i.test(path)) return path
+  return `${API_ORIGIN}${path.startsWith('/') ? path : `/${path}`}`
+}
+
 async function readResponse<T>(response: Response): Promise<T> {
   const text = await response.text()
   let body: unknown = {}
@@ -143,22 +159,24 @@ async function readResponse<T>(response: Response): Promise<T> {
 }
 
 export async function fetchPlateScans(search?: string): Promise<PlateScanDto[]> {
-  const url = search
-    ? '/backend-api/PlateScans?search=' + encodeURIComponent(search)
-    : '/backend-api/PlateScans'
-  const response = await fetch(url, { headers: { Accept: 'application/json' } })
+  const path = search ? `?search=${encodeURIComponent(search)}` : ''
+  const response = await fetch(backendUrl(path), { headers: { Accept: 'application/json' } })
   const result = await readResponse<unknown>(response)
   if (!Array.isArray(result)) throw new Error('Dữ liệu từ backend không đúng định dạng.')
-  return result as PlateScanDto[]
+  return (result as PlateScanDto[]).map((scan) => ({
+    ...scan,
+    imagePath: getScanImageUrl(scan.imagePath),
+    cropImagePath: getScanImageUrl(scan.cropImagePath),
+  }))
 }
 
 export async function fetchPlateScanStats(): Promise<PlateScanStats> {
-  const response = await fetch('/backend-api/PlateScans/stats', { headers: { Accept: 'application/json' } })
+  const response = await fetch(backendUrl('/stats'), { headers: { Accept: 'application/json' } })
   return readResponse<PlateScanStats>(response)
 }
 
 export async function deletePlateScan(id: number): Promise<void> {
-  const response = await fetch('/backend-api/PlateScans/' + id, {
+  const response = await fetch(backendUrl(`/${id}`), {
     method: 'DELETE',
     headers: { Accept: 'application/json' },
   })
@@ -168,13 +186,13 @@ export async function deletePlateScan(id: number): Promise<void> {
 export async function scanPlate(image: Blob): Promise<ScanResult> {
   const form = new FormData()
   form.append('image', image, 'plate-upload.jpg')
-  const response = await fetch('/python-api/scan-plate', { method: 'POST', body: form })
+  const response = await fetch(pythonUrl('scan-plate'), { method: 'POST', body: form })
   return readResponse<ScanResult>(response)
 }
 
 export async function previewPlate(image: Blob): Promise<PlatePreview> {
   const form = new FormData()
   form.append('image', image, 'camera-frame.jpg')
-  const response = await fetch('/python-api/preview-plate', { method: 'POST', body: form })
+  const response = await fetch(pythonUrl('preview-plate'), { method: 'POST', body: form })
   return readResponse<PlatePreview>(response)
 }

@@ -1,0 +1,10 @@
+flask
+gunicorn
+joblib
+numpy
+scikit-learn
+pillow
+opencv-python-headless
+rapidocr
+onnxruntime
+pytesseract

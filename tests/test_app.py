@@ -18,6 +18,31 @@ from train_plate_color import generate_synthetic_plate
 
 
 class TestBackendConfidence(unittest.TestCase):
+    def test_health_route_returns_success(self):
+        response = app.test_client().get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"status": "ok"})
+
+    def test_cors_allows_only_configured_origins(self):
+        with patch("app.app.CORS_ALLOWED_ORIGINS", {"https://parking.example"}):
+            client = app.test_client()
+            allowed = client.get(
+                "/health",
+                headers={"Origin": "https://parking.example"},
+            )
+            denied = client.get(
+                "/health",
+                headers={"Origin": "https://other.example"},
+            )
+
+        self.assertEqual(
+            allowed.headers.get("Access-Control-Allow-Origin"),
+            "https://parking.example",
+        )
+        self.assertIn("Origin", allowed.headers.get("Vary", ""))
+        self.assertIsNone(denied.headers.get("Access-Control-Allow-Origin"))
+
     def test_preserves_zero_ocr_confidence(self):
         self.assertEqual(_confidence_for_backend({"confidence": 0.0}), 0.0)
 

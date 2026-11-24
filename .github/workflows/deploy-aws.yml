@@ -1,0 +1,202 @@
+name: Deploy SMART_PARKING to AWS
+
+on:
+  push:
+    branches:
+      - DangkhoiJR
+    paths:
+      - "Backend/**"
+      - "app/**"
+      - "src/**"
+      - "models/classification/**"
+      - "models/vision/best.onnx"
+      - "outputs/results/**"
+      - "database/**"
+      - "requirements.txt"
+      - "requirements-runtime.txt"
+      - ".dockerignore"
+      - "infra/aws/**"
+      - ".github/workflows/deploy-aws.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: smartparking-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy containers
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-1' }}
+      AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+      AWS_STACK_NAME: ${{ vars.AWS_STACK_NAME || 'smartparking-prod' }}
+
+    steps:
+      - name: Check deployment configuration
+        run: |
+          if [[ -z "$AWS_DEPLOY_ROLE_ARN" ]]; then
+            echo "Set the AWS_DEPLOY_ROLE_ARN repository variable after creating the GitHub OIDC bootstrap stack."
+            exit 1
+          fi
+
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Assume the AWS deployment role with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: smartparking-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-southeast-1' }}
+
+      - name: Read stack outputs and authenticate to ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          outputs="$(aws cloudformation describe-stacks \
+            --stack-name "$AWS_STACK_NAME" \
+            --query 'Stacks[0].Outputs' \
+            --output json)"
+
+          get_output() {
+            local key="$1"
+            jq -er --arg key "$key" '.[] | select(.OutputKey == $key) | .OutputValue' <<< "$outputs"
+          }
+
+          echo "BACKEND_REPOSITORY_URI=$(get_output BackendRepositoryUri)" >> "$GITHUB_ENV"
+          echo "PYTHON_REPOSITORY_URI=$(get_output PythonRepositoryUri)" >> "$GITHUB_ENV"
+          echo "ECS_CLUSTER_NAME=$(get_output EcsClusterName)" >> "$GITHUB_ENV"
+          echo "BACKEND_SERVICE_NAME=$(get_output BackendServiceName)" >> "$GITHUB_ENV"
+          echo "PYTHON_SERVICE_NAME=$(get_output PythonServiceName)" >> "$GITHUB_ENV"
+          echo "BACKEND_TASK_DEFINITION_FAMILY=$(get_output BackendTaskDefinitionFamily)" >> "$GITHUB_ENV"
+          echo "PYTHON_TASK_DEFINITION_FAMILY=$(get_output PythonTaskDefinitionFamily)" >> "$GITHUB_ENV"
+          echo "MIGRATION_TASK_DEFINITION_FAMILY=$(get_output MigrationTaskDefinitionFamily)" >> "$GITHUB_ENV"
+          echo "PUBLIC_SUBNET_IDS=$(get_output PublicSubnetIds)" >> "$GITHUB_ENV"
+          echo "BACKEND_SECURITY_GROUP_ID=$(get_output BackendTaskSecurityGroupId)" >> "$GITHUB_ENV"
+          echo "CLOUDFORMATION_EXECUTION_ROLE_ARN=$(get_output CloudFormationExecutionRoleArn)" >> "$GITHUB_ENV"
+          echo "DATABASE_MIGRATION_LOG_GROUP=/ecs/$AWS_STACK_NAME/database-migration" >> "$GITHUB_ENV"
+
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          registry="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$registry"
+
+      - name: Build and push backend images
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_tag="${GITHUB_SHA}-${GITHUB_RUN_ATTEMPT}"
+          backend_image="${BACKEND_REPOSITORY_URI}:${image_tag}"
+          python_image="${PYTHON_REPOSITORY_URI}:${image_tag}"
+
+          docker build --platform linux/amd64 --file Backend/Dockerfile --tag "$backend_image" .
+          docker build --platform linux/amd64 --file app/Dockerfile --tag "$python_image" .
+          docker push "$backend_image"
+          docker push "$python_image"
+
+          echo "IMAGE_TAG=$image_tag" >> "$GITHUB_ENV"
+
+      - name: Update the migration image
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_tag="$(aws cloudformation describe-stacks \
+            --stack-name "$AWS_STACK_NAME" \
+            --query "Stacks[0].Parameters[?ParameterKey=='MigrationImageTag'].ParameterValue | [0]" \
+            --output text)"
+
+          if [[ "$current_tag" != "$IMAGE_TAG" ]]; then
+            aws cloudformation update-stack \
+              --stack-name "$AWS_STACK_NAME" \
+              --use-previous-template \
+              --role-arn "$CLOUDFORMATION_EXECUTION_ROLE_ARN" \
+              --parameters ParameterKey=MigrationImageTag,ParameterValue="$IMAGE_TAG"
+            aws cloudformation wait stack-update-complete --stack-name "$AWS_STACK_NAME"
+          fi
+
+      - name: Initialize and migrate the SQL Server database
+        shell: bash
+        run: |
+          set -euo pipefail
+          network_configuration="$(jq -cn \
+            --arg subnet_ids "$PUBLIC_SUBNET_IDS" \
+            --arg security_group "$BACKEND_SECURITY_GROUP_ID" \
+            '{awsvpcConfiguration:{subnets:($subnet_ids|split(",")),securityGroups:[$security_group],assignPublicIp:"ENABLED"}}')"
+
+          run_result="$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER_NAME" \
+            --launch-type FARGATE \
+            --task-definition "$MIGRATION_TASK_DEFINITION_FAMILY" \
+            --network-configuration "$network_configuration" \
+            --output json)"
+          task_arn="$(jq -r '.tasks[0].taskArn // empty' <<< "$run_result")"
+
+          if [[ -z "$task_arn" ]]; then
+            echo "Database initializer did not start:"
+            jq '.failures' <<< "$run_result"
+            exit 1
+          fi
+
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER_NAME" --tasks "$task_arn"
+          task_result="$(aws ecs describe-tasks \
+            --cluster "$ECS_CLUSTER_NAME" \
+            --tasks "$task_arn" \
+            --output json)"
+          exit_code="$(jq -r '.tasks[0].containers[] | select(.name == "database-migration") | .exitCode // empty' <<< "$task_result")"
+
+          if [[ "$exit_code" != "0" ]]; then
+            echo "Database initialization failed (exit code: ${exit_code:-unknown}). Recent logs:"
+            aws logs tail "$DATABASE_MIGRATION_LOG_GROUP" --since 10m || true
+            jq '.tasks[0] | {stoppedReason, containers}' <<< "$task_result"
+            exit 1
+          fi
+
+      - name: Update and stabilize ECS services
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_backend_tag="$(aws cloudformation describe-stacks \
+            --stack-name "$AWS_STACK_NAME" \
+            --query "Stacks[0].Parameters[?ParameterKey=='BackendImageTag'].ParameterValue | [0]" \
+            --output text)"
+          current_python_tag="$(aws cloudformation describe-stacks \
+            --stack-name "$AWS_STACK_NAME" \
+            --query "Stacks[0].Parameters[?ParameterKey=='PythonImageTag'].ParameterValue | [0]" \
+            --output text)"
+          current_desired_count="$(aws cloudformation describe-stacks \
+            --stack-name "$AWS_STACK_NAME" \
+            --query "Stacks[0].Parameters[?ParameterKey=='DesiredCount'].ParameterValue | [0]" \
+            --output text)"
+
+          if [[ "$current_backend_tag" != "$IMAGE_TAG" || \
+                "$current_python_tag" != "$IMAGE_TAG" || \
+                "$current_desired_count" != "1" ]]; then
+            aws cloudformation update-stack \
+              --stack-name "$AWS_STACK_NAME" \
+              --use-previous-template \
+              --role-arn "$CLOUDFORMATION_EXECUTION_ROLE_ARN" \
+              --parameters \
+                ParameterKey=BackendImageTag,ParameterValue="$IMAGE_TAG" \
+                ParameterKey=PythonImageTag,ParameterValue="$IMAGE_TAG" \
+                ParameterKey=DesiredCount,ParameterValue=1
+            aws cloudformation wait stack-update-complete --stack-name "$AWS_STACK_NAME"
+          fi
+
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER_NAME" \
+            --services "$BACKEND_SERVICE_NAME" "$PYTHON_SERVICE_NAME"
+
+      - name: Report API endpoint
+        shell: bash
+        run: |
+          api_url="$(aws cloudformation describe-stacks \
+            --stack-name "$AWS_STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiBaseUrl'].OutputValue | [0]" \
+            --output text)"
+          echo "Deployed API origin: $api_url"

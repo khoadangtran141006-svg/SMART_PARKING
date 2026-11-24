@@ -1,0 +1,1054 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  SMART_PARKING production stack for ap-southeast-1: Vercel-facing HTTPS API,
+  ECS Fargate services, private RDS for SQL Server, and persistent scan storage.
+
+Parameters:
+  VercelAllowedOrigins:
+    Type: String
+    Default: ""
+    Description: Comma-separated exact HTTPS origins allowed to call the API from the Vercel frontend.
+  OriginHeaderSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    MaxLength: 128
+    AllowedPattern: "^[A-Za-z0-9_-]+$"
+    Description: Random 32-128 character secret shared by CloudFront and the ALB origin rules.
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.small
+    AllowedValues:
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+    Description: RDS SQL Server Express instance class. Larger classes cost more.
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: Initial RDS storage in GiB.
+  DbBackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+  DesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 10
+    Description: Keep at zero until the first GitHub Actions image deployment succeeds.
+  BackendImageTag:
+    Type: String
+    Default: bootstrap
+    AllowedPattern: "^[A-Za-z0-9_.-]{1,128}$"
+    Description: Managed by the GitHub Actions deployment workflow.
+  PythonImageTag:
+    Type: String
+    Default: bootstrap
+    AllowedPattern: "^[A-Za-z0-9_.-]{1,128}$"
+    Description: Managed by the GitHub Actions deployment workflow.
+  MigrationImageTag:
+    Type: String
+    Default: bootstrap
+    AllowedPattern: "^[A-Za-z0-9_.-]{1,128}$"
+    Description: Managed by the GitHub Actions deployment workflow.
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+        - Key: Project
+          Value: SMART_PARKING
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+
+  VpcInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-a"
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-b"
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-a"
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-b"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-routes"
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetA
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetB
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-routes"
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetA
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetB
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP origin reachable through CloudFront; ALB rules require the origin secret.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb-sg"
+
+  BackendTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ASP.NET Core tasks accept traffic only from the ALB and Python tasks.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-backend-sg"
+
+  PythonTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Python OCR tasks accept traffic only from the ALB.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-python-sg"
+
+  BackendFromPythonIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BackendTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref PythonTaskSecurityGroup
+      Description: Allow Python scan workers to persist scan results to the internal API.
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SQL Server accepts connections only from the ASP.NET Core tasks.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1433
+          ToPort: 1433
+          SourceSecurityGroupId: !Ref BackendTaskSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-database-sg"
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS NFS access only from Python OCR tasks.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref PythonTaskSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-efs-sg"
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for SMART_PARKING SQL Server.
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-database-subnets"
+
+  SmartParkingDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-sqlserver"
+      Engine: sqlserver-ex
+      LicenseModel: license-included
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: true
+      ManageMasterUserPassword: true
+      MasterUsername: smartparking_admin
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: !Ref DbBackupRetentionDays
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sqlserver"
+        - Key: Project
+          Value: SMART_PARKING
+
+  ApplicationDatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/application-database"
+      Description: Restricted SQL Server login used by the SMART_PARKING API.
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"smartparking_app"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags:
+        - Key: Project
+          Value: SMART_PARKING
+
+  ScanFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      BackupPolicy:
+        Status: ENABLED
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-scan-files"
+        - Key: Project
+          Value: SMART_PARKING
+
+  ScanFileSystemMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref ScanFileSystem
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  ScanFileSystemMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref ScanFileSystem
+      SubnetId: !Ref PrivateSubnetB
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  ScanFileSystemAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref ScanFileSystem
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: /scan-data
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "0770"
+
+  BackendRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}-backend"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Keep the 10 newest images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+      Tags:
+        - Key: Project
+          Value: SMART_PARKING
+
+  PythonRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}-python"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Keep the 10 newest images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+      Tags:
+        - Key: Project
+          Value: SMART_PARKING
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Project
+          Value: SMART_PARKING
+
+  PrivateServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: smartparking.local
+      Vpc: !Ref Vpc
+      Description: Private DNS namespace for internal ECS communication.
+
+  BackendDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: backend
+      DnsConfig:
+        NamespaceId: !GetAtt PrivateServiceDiscoveryNamespace.Id
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - Type: A
+            TTL: "10"
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}/backend"
+      RetentionInDays: 30
+
+  PythonLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}/python"
+      RetentionInDays: 30
+
+  DatabaseMigrationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}/database-migration"
+      RetentionInDays: 30
+
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ecs-execution"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadSmartParkingRuntimeSecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !GetAtt SmartParkingDatabase.MasterUserSecret.SecretArn
+                  - !Ref ApplicationDatabaseSecret
+      Tags:
+        - Key: Project
+          Value: SMART_PARKING
+
+  CloudFormationEcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-cfn-ecs-execution"
+      Description: Limited CloudFormation service role for ECS task-definition deployments.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
+      Policies:
+        - PolicyName: UpdateSmartParkingEcsTasks
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${AWS::StackName}-cluster/${AWS::StackName}-backend-service"
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${AWS::StackName}-cluster/${AWS::StackName}-python-service"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt EcsTaskExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: SMART_PARKING
+
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-backend"
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  PythonTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-python"
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 5000
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  ApiLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - Key: Project
+          Value: SMART_PARKING
+
+  ApiHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApiLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "403"
+            ContentType: application/json
+            MessageBody: '{"message":"Forbidden"}'
+
+  BackendListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ApiHttpListener
+      Priority: 10
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Ref OriginHeaderSecret
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /api/PlateScans*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  PythonScanListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ApiHttpListener
+      Priority: 20
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Ref OriginHeaderSecret
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /api/scan-plate*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref PythonTargetGroup
+
+  PythonPreviewListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ApiHttpListener
+      Priority: 21
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Ref OriginHeaderSecret
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /api/preview-plate*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref PythonTargetGroup
+
+  PythonClassifyListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ApiHttpListener
+      Priority: 22
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Ref OriginHeaderSecret
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /api/classify-plate-color*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref PythonTargetGroup
+
+  PythonModelInfoListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ApiHttpListener
+      Priority: 23
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Ref OriginHeaderSecret
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /api/model-info*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref PythonTargetGroup
+
+  PythonScansListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ApiHttpListener
+      Priority: 24
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Ref OriginHeaderSecret
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /api/scans*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref PythonTargetGroup
+
+  PythonImageListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ApiHttpListener
+      Priority: 25
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Ref OriginHeaderSecret
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /scan-image/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref PythonTargetGroup
+
+  ApiCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+      - ApiHttpListener
+      - BackendListenerRule
+      - PythonScanListenerRule
+      - PythonPreviewListenerRule
+      - PythonClassifyListenerRule
+      - PythonModelInfoListenerRule
+      - PythonScansListenerRule
+      - PythonImageListenerRule
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "SMART_PARKING API - ${AWS::StackName}"
+        HttpVersion: http2and3
+        PriceClass: PriceClass_200
+        Origins:
+          - Id: SmartParkingApiOrigin
+            DomainName: !GetAtt ApiLoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 120
+              OriginKeepaliveTimeout: 60
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref OriginHeaderSecret
+        DefaultCacheBehavior:
+          TargetOriginId: SmartParkingApiOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - PATCH
+            - POST
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          Compress: true
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+      Tags:
+        - Key: Project
+          Value: SMART_PARKING
+
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-backend"
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: smartparking-api
+          Image: !Sub "${BackendRepository.RepositoryUri}:${BackendImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: ASPNETCORE_ENVIRONMENT
+              Value: Production
+            - Name: ASPNETCORE_URLS
+              Value: http://+:8080
+            - Name: CORS_ALLOWED_ORIGINS
+              Value: !Ref VercelAllowedOrigins
+            - Name: DB_NAME
+              Value: SmartParking
+            - Name: DB_PORT
+              Value: "1433"
+            - Name: DB_ENCRYPT
+              Value: "true"
+            - Name: DB_TRUST_SERVER_CERTIFICATE
+              Value: "false"
+          Secrets:
+            - Name: DB_HOST
+              ValueFrom: !Sub "${SmartParkingDatabase.MasterUserSecret.SecretArn}:host::"
+            - Name: DB_USER
+              ValueFrom: !Sub "${ApplicationDatabaseSecret}:username::"
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub "${ApplicationDatabaseSecret}:password::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  DatabaseMigrationTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-db-init"
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: database-migration
+          Image: !Sub "${BackendRepository.RepositoryUri}:${MigrationImageTag}"
+          Essential: true
+          Command:
+            - --initialize-db
+          Environment:
+            - Name: DB_NAME
+              Value: SmartParking
+            - Name: DB_PORT
+              Value: "1433"
+            - Name: DB_ENCRYPT
+              Value: "true"
+            - Name: DB_TRUST_SERVER_CERTIFICATE
+              Value: "false"
+            - Name: APP_DB_USER
+              Value: smartparking_app
+          Secrets:
+            - Name: DB_HOST
+              ValueFrom: !Sub "${SmartParkingDatabase.MasterUserSecret.SecretArn}:host::"
+            - Name: DB_ADMIN_USER
+              ValueFrom: !Sub "${SmartParkingDatabase.MasterUserSecret.SecretArn}:username::"
+            - Name: DB_ADMIN_PASSWORD
+              ValueFrom: !Sub "${SmartParkingDatabase.MasterUserSecret.SecretArn}:password::"
+            - Name: APP_DB_PASSWORD
+              ValueFrom: !Sub "${ApplicationDatabaseSecret}:password::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DatabaseMigrationLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: init
+
+  PythonTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-python"
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: "2048"
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      Volumes:
+        - Name: scan-files
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref ScanFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref ScanFileSystemAccessPoint
+              IAM: DISABLED
+      ContainerDefinitions:
+        - Name: smartparking-python
+          Image: !Sub "${PythonRepository.RepositoryUri}:${PythonImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 5000
+              Protocol: tcp
+          Environment:
+            - Name: SMARTPARKING_API_URL
+              Value: http://backend.smartparking.local:8080
+            - Name: FLASK_DEBUG
+              Value: "0"
+            - Name: CORS_ALLOWED_ORIGINS
+              Value: !Ref VercelAllowedOrigins
+          MountPoints:
+            - SourceVolume: scan-files
+              ContainerPath: /workspace/data/processed/scans
+              ReadOnly: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref PythonLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ocr
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)\""
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  BackendEcsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - BackendListenerRule
+      - ScanFileSystemMountTargetA
+      - ScanFileSystemMountTargetB
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-backend-service"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref BackendTaskSecurityGroup
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+      LoadBalancers:
+        - ContainerName: smartparking-api
+          ContainerPort: 8080
+          TargetGroupArn: !Ref BackendTargetGroup
+      ServiceRegistries:
+        - RegistryArn: !GetAtt BackendDiscoveryService.Arn
+      Tags:
+        - Key: Project
+          Value: SMART_PARKING
+
+  PythonEcsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - PythonScanListenerRule
+      - PythonPreviewListenerRule
+      - PythonClassifyListenerRule
+      - PythonModelInfoListenerRule
+      - PythonScansListenerRule
+      - PythonImageListenerRule
+      - ScanFileSystemMountTargetA
+      - ScanFileSystemMountTargetB
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-python-service"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref PythonTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      HealthCheckGracePeriodSeconds: 90
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref PythonTaskSecurityGroup
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+      LoadBalancers:
+        - ContainerName: smartparking-python
+          ContainerPort: 5000
+          TargetGroupArn: !Ref PythonTargetGroup
+      Tags:
+        - Key: Project
+          Value: SMART_PARKING
+
+Outputs:
+  StackName:
+    Description: CloudFormation stack name used by the GitHub Actions workflow.
+    Value: !Ref AWS::StackName
+  ApiBaseUrl:
+    Description: HTTPS API origin to set as VITE_API_ORIGIN in Vercel.
+    Value: !Sub "https://${ApiCloudFrontDistribution.DomainName}"
+  CloudFrontDistributionDomain:
+    Description: CloudFront hostname; HTTPS is enabled by the default CloudFront certificate.
+    Value: !GetAtt ApiCloudFrontDistribution.DomainName
+  BackendRepositoryUri:
+    Value: !GetAtt BackendRepository.RepositoryUri
+  PythonRepositoryUri:
+    Value: !GetAtt PythonRepository.RepositoryUri
+  EcsClusterName:
+    Value: !Ref EcsCluster
+  BackendServiceName:
+    Value: !Sub "${AWS::StackName}-backend-service"
+  PythonServiceName:
+    Value: !Sub "${AWS::StackName}-python-service"
+  BackendTaskDefinitionFamily:
+    Value: !Sub "${AWS::StackName}-backend"
+  PythonTaskDefinitionFamily:
+    Value: !Sub "${AWS::StackName}-python"
+  MigrationTaskDefinitionFamily:
+    Value: !Sub "${AWS::StackName}-db-init"
+  PublicSubnetIds:
+    Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+  BackendTaskSecurityGroupId:
+    Value: !Ref BackendTaskSecurityGroup
+  DatabaseEndpoint:
+    Description: Private RDS endpoint. It is reachable only from the backend security group.
+    Value: !GetAtt SmartParkingDatabase.Endpoint.Address
+  DatabaseSecretArn:
+    Description: RDS-managed master secret ARN; never store its value in source control.
+    Value: !GetAtt SmartParkingDatabase.MasterUserSecret.SecretArn
+  ApplicationDatabaseSecretArn:
+    Description: Restricted application SQL login secret ARN.
+    Value: !Ref ApplicationDatabaseSecret
+  EfsFileSystemId:
+    Value: !Ref ScanFileSystem
+  CloudFormationExecutionRoleArn:
+    Description: Least-privilege role used for image-driven CloudFormation updates.
+    Value: !GetAtt CloudFormationEcsExecutionRole.Arn
+  DatabaseInstanceClass:
+    Value: !Ref DbInstanceClass
