@@ -1,4 +1,5 @@
-using Microsoft.Data.SqlClient;
+
+using Npgsql;
 using Microsoft.Extensions.Configuration;
 using System.Data;
 
@@ -10,40 +11,65 @@ public class DbConnectionFactory
 
     public DbConnectionFactory(IConfiguration configuration)
     {
-        var host = configuration["DB_HOST"];
-        if (!string.IsNullOrWhiteSpace(host))
+        var connectionString =
+            configuration["DATABASE_URL"]
+            ?? configuration.GetConnectionString("DefaultConnection");
+
+        if (string.IsNullOrWhiteSpace(connectionString))
         {
-            var port = configuration["DB_PORT"] ?? "1433";
-            var connectionString = new SqlConnectionStringBuilder
-            {
-                DataSource = $"{host},{port}",
-                InitialCatalog = configuration["DB_NAME"] ?? "SmartParking",
-                UserID = configuration["DB_USER"] ?? throw new InvalidOperationException("Thiếu DB_USER."),
-                Password = configuration["DB_PASSWORD"] ?? throw new InvalidOperationException("Thiếu DB_PASSWORD."),
-                TrustServerCertificate = bool.TryParse(configuration["DB_TRUST_SERVER_CERTIFICATE"], out var trustCertificate)
-                    && trustCertificate,
-                ConnectTimeout = 30,
-            };
-
-            connectionString.Encrypt = string.Equals(
-                configuration["DB_ENCRYPT"],
-                "false",
-                StringComparison.OrdinalIgnoreCase)
-                    ? SqlConnectionEncryptOption.Optional
-                    : SqlConnectionEncryptOption.Mandatory;
-
-            _connectionString = connectionString.ConnectionString;
-            return;
+            throw new InvalidOperationException(
+                "Không tìm thấy DATABASE_URL hoặc ConnectionStrings:DefaultConnection.");
         }
 
-        _connectionString =
-            configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException(
-                "Không tìm thấy DB_HOST hoặc ConnectionStrings:DefaultConnection.");
+        _connectionString = NormalizeConnectionString(connectionString);
+    }
+
+    private static string NormalizeConnectionString(string connectionString)
+    {
+        // Hỗ trợ PostgreSQL URI từ Neon:
+        // postgresql://username:password@host/database?sslmode=require
+        if (connectionString.StartsWith(
+            "postgres://", StringComparison.OrdinalIgnoreCase)
+            || connectionString.StartsWith(
+            "postgresql://", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!Uri.TryCreate(connectionString, UriKind.Absolute, out var uri))
+            {
+                throw new InvalidOperationException(
+                    "DATABASE_URL không đúng định dạng PostgreSQL URI.");
+            }
+
+            var userInfo = uri.UserInfo.Split(':', 2);
+
+            if (userInfo.Length != 2 || string.IsNullOrWhiteSpace(uri.AbsolutePath))
+            {
+                throw new InvalidOperationException(
+                    "DATABASE_URL thiếu username, password hoặc database.");
+            }
+
+            var builder = new NpgsqlConnectionStringBuilder
+            {
+                Host = uri.Host,
+                Port = uri.IsDefaultPort ? 5432 : uri.Port,
+                Database = Uri.UnescapeDataString(
+                    uri.AbsolutePath.TrimStart('/')),
+                Username = Uri.UnescapeDataString(userInfo[0]),
+                Password = Uri.UnescapeDataString(userInfo[1]),
+                SslMode = SslMode.Require,
+                Pooling = true,
+                Timeout = 30
+            };
+
+            return builder.ConnectionString;
+        }
+
+        // Hỗ trợ connection string dạng key=value của Npgsql.
+        return new NpgsqlConnectionStringBuilder(connectionString)
+            .ConnectionString;
     }
 
     public IDbConnection CreateConnection()
     {
-        return new SqlConnection(_connectionString);
+        return new NpgsqlConnection(_connectionString);
     }
 }

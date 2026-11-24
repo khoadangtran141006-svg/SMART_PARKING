@@ -1,3 +1,4 @@
+
 using Smartparking.Api;
 using SmartParking.Application.Interfaces;
 using SmartParking.Application.Services;
@@ -9,6 +10,8 @@ var builder = WebApplication.CreateBuilder(args);
 var allowedOrigins = builder.Configuration["CORS_ALLOWED_ORIGINS"]?
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
     ?? [];
+
+var enableSwagger = builder.Configuration.GetValue<bool>("ENABLE_SWAGGER");
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
@@ -28,6 +31,7 @@ builder.Services.AddSingleton<DbConnectionFactory>();
 builder.Services.AddScoped<IPlateScanRepository, PlateScanRepository>();
 builder.Services.AddScoped<IPlateScanService, PlateScanService>();
 
+// Chỉ khởi tạo schema khi chạy với tham số --initialize-db.
 if (args.Contains("--initialize-db", StringComparer.Ordinal))
 {
     await DatabaseBootstrapper.InitializeAsync(builder.Configuration);
@@ -36,7 +40,7 @@ if (args.Contains("--initialize-db", StringComparer.Ordinal))
 
 var app = builder.Build();
 
-if (app.Environment.IsDevelopment())
+if (app.Environment.IsDevelopment() || enableSwagger)
 {
     app.UseSwagger();
     app.UseSwaggerUI();
@@ -48,7 +52,13 @@ if (allowedOrigins.Length > 0)
 }
 
 app.UseHttpsRedirection();
-app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+
+app.MapGet("/health", () => Results.Ok(new
+{
+    status = "ok",
+    database = "PostgreSQL"
+}));
+
 app.MapControllers();
 
 app.Run();
