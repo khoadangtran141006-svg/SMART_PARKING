@@ -129,20 +129,29 @@ export type ScanResult = {
   [key: string]: unknown
 }
 
-const API_ORIGIN = (import.meta.env.VITE_API_ORIGIN ?? '').replace(/\/+$/, '')
+const BACKEND_API_URL = (
+  import.meta.env.VITE_BACKEND_API_URL ?? ''
+).replace(/\/+$/, '')
+
+const PYTHON_API_URL = (
+  import.meta.env.VITE_PYTHON_API_URL ?? ''
+).replace(/\/+$/, '')
 
 function backendUrl(path: string): string {
-  return API_ORIGIN ? `${API_ORIGIN}/api/PlateScans${path}` : `/backend-api/PlateScans${path}`
+  return BACKEND_API_URL
+    ? `${BACKEND_API_URL}/api/PlateScans${path}`
+    : `/backend-api/PlateScans${path}`
 }
 
 function pythonUrl(path: string): string {
-  return API_ORIGIN ? `${API_ORIGIN}/api/${path}` : `/python-api/${path}`
+  return PYTHON_API_URL
+    ? `${PYTHON_API_URL}/api/${path}`
+    : `/python-api/${path}`
 }
-
 export function getScanImageUrl(path: string | null | undefined): string | null {
   if (!path) return null
   if (/^https?:\/\//i.test(path)) return path
-  return `${API_ORIGIN}${path.startsWith('/') ? path : `/${path}`}`
+  return `${PYTHON_API_URL}${path.startsWith('/') ? path : `/${path}`}`
 }
 
 async function readResponse<T>(response: Response): Promise<T> {
